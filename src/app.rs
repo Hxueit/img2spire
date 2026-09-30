@@ -320,7 +320,7 @@ impl AutoDrawerApp {
                     ui.painter().rect_stroke(
                         egui::Rect::from_two_pos(start, curr),
                         0.0,
-                        egui::Stroke::new(2.0, egui::Color32::RED),
+                        egui::Stroke::new(2.0_f32, egui::Color32::RED),
                         egui::StrokeKind::Middle,
                     );
                 }
@@ -595,10 +595,12 @@ impl AutoDrawerApp {
                 let to_screen = |&(x, y): &(f32, f32)| {
                     egui::pos2(rect.min.x + x * scale, rect.min.y + y * scale)
                 };
-                let pending = egui::Stroke::new(1.5, egui::Color32::GREEN);
-                let done = egui::Stroke::new(1.5, egui::Color32::from_rgb(60, 120, 60));
-                let travel =
-                    egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 170, 0, 140));
+                let pending = egui::Stroke::new(1.5_f32, egui::Color32::GREEN);
+                let done = egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(60, 120, 60));
+                let travel = egui::Stroke::new(
+                    1.0_f32,
+                    egui::Color32::from_rgba_unmultiplied(255, 170, 0, 140),
+                );
 
                 let mut counted = 0usize;
                 let mut prev_end: Option<egui::Pos2> = None;
