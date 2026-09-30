@@ -1,26 +1,37 @@
 [package]
 name = "img2spire"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
 crossbeam-channel = "0.5.15"
-eframe = "0.33.3"
-enigo = "0.6.1"
+eframe = { version = "0.33.3", features = ["persistence"] }
 env_logger = "0.11.10"
 global-hotkey = "0.7.0"
 image = "0.25.10"
 imageproc = "0.26.1"
 log = "0.4.29"
 rfd = "0.17.2"
+serde = { version = "1", features = ["derive"] }
 xcap = "0.9.3"
+
+# Windows 下直接用 SendInput（带 MOUSEEVENTF_VIRTUALDESK）以支持多显示器；
+# 其他平台仅用于开发与测试，沿用 enigo。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(not(windows))'.dependencies]
+enigo = "0.6.1"
 
 [profile.dev.package."*"]
 opt-level = 3
 
 [profile.release]
-opt-level = "z"     
-lto = true          
-codegen-units = 1   
-panic = "abort"     
-strip = true        
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

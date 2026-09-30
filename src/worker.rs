@@ -1,314 +1,231 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
 use eframe::egui::Context;
-use enigo::{Button, Coordinate, Direction, Enigo, Mouse, Settings};
 use image::GrayImage;
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, ParseParams};
+use crate::geometry::{
+    self, DrawBox, MOVE_SETTLE, PRESS_SETTLE, RELEASE_SETTLE, SUBSTEP_SLEEP, ScreenStroke,
+};
 use crate::image_parser;
-use crate::messages::{AppMessage, WorkerToAppMsg};
+use crate::messages::{AppMessage, ParseResult, Trajectories, WorkerToAppMsg};
+use crate::mouse::{Mouse, Pen};
 use crate::trajectory_optimizer;
+
+/// 未能获取显示器尺寸时的兜底值
+const FALLBACK_SCREEN: (i32, i32) = (1920, 1080);
+const PAUSE_POLL: Duration = Duration::from_millis(50);
+
+/// UI 线程与绘画线程共享的状态
+#[derive(Default)]
+pub struct DrawControl {
+    pub is_drawing: AtomicBool,
+    pub is_paused: AtomicBool,
+    /// 已绘制 / 总计的轨迹点数，用于进度显示
+    pub progress_done: AtomicUsize,
+    pub progress_total: AtomicUsize,
+}
+
+impl DrawControl {
+    fn stopped(&self) -> bool {
+        !self.is_drawing.load(Ordering::Acquire)
+    }
+}
 
 pub fn drawing_worker_thread(
     rx_app: Receiver<AppMessage>,
     tx_ui: Sender<WorkerToAppMsg>,
-    is_drawing: Arc<AtomicBool>,
-    is_paused: Arc<AtomicBool>,
+    control: Arc<DrawControl>,
     ctx: Context,
 ) {
-    let mut cached_gray_image: Option<GrayImage> = None;
-    let mut current_trajectories: Option<Arc<Vec<Vec<(f32, f32)>>>> = None;
+    let send = |msg: WorkerToAppMsg| {
+        let _ = tx_ui.send(msg);
+        ctx.request_repaint();
+    };
 
-    // 初始化一次 Enigo 实例并长期持有复用
-    let mut enigo = match Enigo::new(&Settings::default()) {
-        Ok(e) => e,
-        Err(err) => {
-            let _ = tx_ui.send(WorkerToAppMsg::Error(format!("初始化输入设备失败: {:?}", err)));
-            return;
+    let mut mouse = match Mouse::new() {
+        Ok(m) => Some(m),
+        Err(e) => {
+            send(WorkerToAppMsg::Error(e));
+            None
         }
     };
 
-    while let Ok(msg) = rx_app.recv() {
+    let mut cached_gray_image: Option<GrayImage> = None;
+    let mut current_trajectories: Option<Trajectories> = None;
+    let mut pending: Option<AppMessage> = None;
+
+    loop {
+        let msg = match pending.take() {
+            Some(m) => m,
+            None => match rx_app.recv() {
+                Ok(m) => m,
+                Err(_) => break,
+            },
+        };
+
         match msg {
-            AppMessage::LoadImage(path, config) => {
-                if let Ok(img) = image::open(&path) {
-                    let mut gray = img.into_luma8();
-                    let max_dim = 1024;
-                    if gray.width() > max_dim || gray.height() > max_dim {
-                        let scale = (max_dim as f32 / gray.width() as f32)
-                            .min(max_dim as f32 / gray.height() as f32);
-                        gray = image::imageops::resize(
-                            &gray,
-                            (gray.width() as f32 * scale) as u32,
-                            (gray.height() as f32 * scale) as u32,
-                            image::imageops::FilterType::Triangle,
-                        );
-                    }
-
-                    let dims = gray.dimensions();
-                    let raw_lines = image_parser::parse_image_to_lines(
-                        &gray,
-                        config.edge_threshold_low,
-                        config.edge_threshold_high,
-                    );
-                    let orig_pts = raw_lines.iter().map(|l| l.len()).sum();
-                    
-                    let opt_lines = Arc::new(trajectory_optimizer::optimize_trajectories(
-                        &raw_lines,
-                        config.simplify_tolerance,
-                    ));
-                    let opt_pts = opt_lines.iter().map(|l| l.len()).sum();
-
-                    let _ = tx_ui.send(WorkerToAppMsg::ParsedTrajectories(
-                        Arc::clone(&opt_lines),
-                        orig_pts,
-                        opt_pts,
-                        dims,
-                    ));
-                    ctx.request_repaint();
-                    current_trajectories = Some(opt_lines);
+            AppMessage::LoadImage(path, params) => match image_parser::load_gray(&path) {
+                Ok(gray) => {
+                    let result = parse(&gray, params);
+                    current_trajectories = Some(Arc::clone(&result.lines));
                     cached_gray_image = Some(gray);
-                } else {
-                    let _ = tx_ui.send(WorkerToAppMsg::Error("无法加载图片".into()));
-                    ctx.request_repaint();
+                    send(WorkerToAppMsg::Parsed(result));
                 }
-            }
-            AppMessage::Reparse(config) => {
+                Err(e) => send(WorkerToAppMsg::Error(e)),
+            },
+            AppMessage::Reparse(mut params) => {
+                // 拖动滑条会连续发送大量 Reparse，只处理最新的一条
+                while let Ok(next) = rx_app.try_recv() {
+                    match next {
+                        AppMessage::Reparse(p) => params = p,
+                        other => {
+                            pending = Some(other);
+                            break;
+                        }
+                    }
+                }
                 if let Some(gray) = &cached_gray_image {
-                    let dims = gray.dimensions();
-                    let raw_lines = image_parser::parse_image_to_lines(
-                        gray,
-                        config.edge_threshold_low,
-                        config.edge_threshold_high,
-                    );
-                    let orig_pts = raw_lines.iter().map(|l| l.len()).sum();
-                    
-                    let opt_lines = Arc::new(trajectory_optimizer::optimize_trajectories(
-                        &raw_lines,
-                        config.simplify_tolerance,
-                    ));
-                    let opt_pts = opt_lines.iter().map(|l| l.len()).sum();
-
-                    let _ = tx_ui.send(WorkerToAppMsg::ParsedTrajectories(
-                        Arc::clone(&opt_lines),
-                        orig_pts,
-                        opt_pts,
-                        dims,
-                    ));
-                    ctx.request_repaint();
-                    current_trajectories = Some(opt_lines);
+                    let result = parse(gray, params);
+                    current_trajectories = Some(Arc::clone(&result.lines));
+                    send(WorkerToAppMsg::Parsed(result));
                 }
             }
             AppMessage::StartDrawing(config) => {
-                if let Some(lines) = &current_trajectories {
-                    is_drawing.store(true, Ordering::Release);
-                    is_paused.store(false, Ordering::Release);
-
-                    let img_w = cached_gray_image.as_ref().map(|g| g.width() as f32).unwrap_or(1.0);
-                    let img_h = cached_gray_image.as_ref().map(|g| g.height() as f32).unwrap_or(1.0);
-                    
-                    if let Err(e) = execute_drawing(&mut enigo, lines, config, img_w, img_h, &is_drawing, &is_paused) {
-                        let _ = tx_ui.send(WorkerToAppMsg::Error(e));
+                let result = match (&mut mouse, &current_trajectories, &cached_gray_image) {
+                    (None, ..) => Err("输入设备不可用".to_string()),
+                    (_, None, _) | (_, _, None) => Err("没有可用的轨迹".to_string()),
+                    (Some(mouse), Some(lines), Some(gray)) => {
+                        let draw_box = DrawBox::from_config(&config, screen_size(mouse));
+                        let strokes =
+                            draw_box.map_strokes(lines, gray.width() as f32, gray.height() as f32);
+                        draw_strokes(mouse, &strokes, &config, &control)
                     }
-                    
-                    is_drawing.store(false, Ordering::Release);
-                    ctx.request_repaint();
-                } else {
-                    let _ = tx_ui.send(WorkerToAppMsg::Error("没有可用的轨迹".into()));
-                    is_drawing.store(false, Ordering::Release);
-                    ctx.request_repaint();
-                }
+                };
+                finish(&control, result, &send);
             }
             AppMessage::StartMistMode(config) => {
-                is_drawing.store(true, Ordering::Release);
-                is_paused.store(false, Ordering::Release);
-                
-                if let Err(e) = start_brute_mist_task(&mut enigo, config, &is_drawing, &is_paused) {
-                    let _ = tx_ui.send(WorkerToAppMsg::Error(e));
-                }
-                
-                is_drawing.store(false, Ordering::Release);
-                ctx.request_repaint();
+                let result = match &mut mouse {
+                    None => Err("输入设备不可用".to_string()),
+                    Some(mouse) => {
+                        let draw_box = DrawBox::from_config(&config, screen_size(mouse));
+                        let path = draw_box.mist_path(config.mist_spacing_px);
+                        draw_strokes(mouse, &[path], &config, &control)
+                    }
+                };
+                finish(&control, result, &send);
             }
         }
     }
 }
 
-fn execute_drawing(
-    enigo: &mut Enigo,
-    lines: &[Vec<(f32, f32)>],
-    config: AppConfig,
-    img_w: f32,
-    img_h: f32,
-    is_drawing: &AtomicBool,
-    is_paused: &AtomicBool,
+fn screen_size(mouse: &Mouse) -> (i32, i32) {
+    mouse.primary_size().unwrap_or(FALLBACK_SCREEN)
+}
+
+fn finish(control: &DrawControl, result: Result<(), String>, send: &impl Fn(WorkerToAppMsg)) {
+    control.is_drawing.store(false, Ordering::Release);
+    control.is_paused.store(false, Ordering::Release);
+    send(match result {
+        Ok(()) => WorkerToAppMsg::DrawingFinished,
+        Err(e) => WorkerToAppMsg::Error(e),
+    });
+}
+
+fn parse(gray: &GrayImage, params: ParseParams) -> ParseResult {
+    let raw_lines = image_parser::parse_image_to_lines(
+        gray,
+        params.edge_threshold_low,
+        params.edge_threshold_high,
+    );
+    let raw_points = raw_lines.iter().map(|l| l.len()).sum();
+    let optimized =
+        trajectory_optimizer::optimize_trajectories(&raw_lines, params.simplify_tolerance);
+    let ordered = trajectory_optimizer::order_strokes(optimized, (0.0, 0.0));
+    let optimized_points = ordered.iter().map(|l| l.len()).sum();
+    ParseResult {
+        lines: Arc::new(ordered),
+        raw_points,
+        optimized_points,
+        image_size: gray.dimensions(),
+    }
+}
+
+/// 按顺序绘制屏幕坐标下的笔画。随时响应停止与暂停；
+/// 任何情况下退出（包括出错）都会由 `Pen` 自动抬起右键。
+fn draw_strokes(
+    mouse: &mut Mouse,
+    strokes: &[ScreenStroke],
+    config: &AppConfig,
+    control: &DrawControl,
 ) -> Result<(), String> {
-    // 统一物理坐标空间：兼容多屏并正确叠加显示器物理偏移量
-    let (mw, mh) = if config.monitor_w > 0 {
-        (config.monitor_w, config.monitor_h)
-    } else {
-        enigo.main_display().unwrap_or((1920, 1080))
-    };
-    
-    let sw = mw as f32;
-    let sh = mh as f32;
-    let base_x = config.monitor_x as f32;
-    let base_y = config.monitor_y as f32;
-
-    let box_x = base_x + sw * (config.left_margin as f32 / 100.0);
-    let box_y = base_y + sh * (config.top_margin as f32 / 100.0);
-    let box_w = sw * (1.0 - (config.left_margin + config.right_margin) as f32 / 100.0);
-    let box_h = sh * (1.0 - (config.top_margin + config.bottom_margin) as f32 / 100.0);
-
-    let scale = (box_w / img_w).min(box_h / img_h);
-    let offset_x = box_x + (box_w - img_w * scale) / 2.0;
-    let offset_y = box_y + (box_h - img_h * scale) / 2.0;
-
     let delay = Duration::from_millis(config.draw_delay_ms);
+    let max_step = config.drag_step_px.max(1.0);
+    let substep_sleep = geometry::needs_substep_sleep(config);
 
-    'outer: for line in lines {
-        if !is_drawing.load(Ordering::Acquire) { break; }
-        if line.is_empty() { continue; }
+    control.progress_done.store(0, Ordering::Release);
+    control
+        .progress_total
+        .store(strokes.iter().map(|s| s.len()).sum(), Ordering::Release);
 
-        let start_x = (offset_x + line[0].0 * scale) as i32;
-        let start_y = (offset_y + line[0].1 * scale) as i32;
-        
-        enigo.move_mouse(start_x, start_y, Coordinate::Abs).map_err(|e| format!("鼠标移动失败: {:?}", e))?;
-        thread::sleep(Duration::from_millis(10));
-        enigo.button(Button::Right, Direction::Press).map_err(|e| format!("鼠标点击失败: {:?}", e))?;
-        thread::sleep(Duration::from_millis(5));
+    let mut pen = Pen::new(mouse);
 
-        let mut last_px = start_x;
-        let mut last_py = start_y;
+    for stroke in strokes {
+        let Some(&start) = stroke.first() else {
+            continue;
+        };
+        if control.stopped() {
+            return Ok(());
+        }
+        pen.move_to(start)?;
+        thread::sleep(MOVE_SETTLE);
+        pen.down()?;
+        thread::sleep(PRESS_SETTLE);
+        control.progress_done.fetch_add(1, Ordering::AcqRel);
 
-        for pt in line.iter().skip(1) {
-            if !is_drawing.load(Ordering::Acquire) { break 'outer; }
-            
-            if is_paused.load(Ordering::Acquire) {
-                enigo.button(Button::Right, Direction::Release).map_err(|e| format!("鼠标点击失败: {:?}", e))?;
-                while is_paused.load(Ordering::Acquire) {
-                    if !is_drawing.load(Ordering::Acquire) { break 'outer; }
-                    thread::sleep(Duration::from_millis(50));
-                }
-                enigo.move_mouse(last_px, last_py, Coordinate::Abs).map_err(|e| format!("鼠标移动失败: {:?}", e))?;
-                thread::sleep(Duration::from_millis(10));
-                enigo.button(Button::Right, Direction::Press).map_err(|e| format!("鼠标点击失败: {:?}", e))?;
-            }
-
-            let px = (offset_x + pt.0 * scale) as i32;
-            let py = (offset_y + pt.1 * scale) as i32;
-            
-            let dx = px as f32 - last_px as f32;
-            let dy = py as f32 - last_py as f32;
-            let d = (dx * dx + dy * dy).sqrt();
-            
-            if d > config.drag_step_px {
-                let steps = (d / config.drag_step_px) as i32;
-                for s in 1..=steps {
-                    let ix = (last_px as f32 + dx * (s as f32 / steps as f32)) as i32;
-                    let iy = (last_py as f32 + dy * (s as f32 / steps as f32)) as i32;
-                    enigo.move_mouse(ix, iy, Coordinate::Abs).map_err(|e| format!("鼠标移动失败: {:?}", e))?;
-                    if config.drag_step_px < 20.0 && delay.as_millis() == 0 {
-                        thread::sleep(Duration::from_micros(500));
+        let mut last = start;
+        for &target in &stroke[1..] {
+            if control.is_paused.load(Ordering::Acquire) {
+                pen.up()?;
+                while control.is_paused.load(Ordering::Acquire) {
+                    if control.stopped() {
+                        return Ok(());
                     }
+                    thread::sleep(PAUSE_POLL);
                 }
-            } else {
-                enigo.move_mouse(px, py, Coordinate::Abs).map_err(|e| format!("鼠标移动失败: {:?}", e))?;
+                // 先回到断点再按下，避免在用户暂停期间移走的鼠标位置落笔
+                pen.move_to(last)?;
+                thread::sleep(MOVE_SETTLE);
+                pen.down()?;
+                thread::sleep(PRESS_SETTLE);
             }
-            last_px = px;
-            last_py = py;
-            
-            if delay.as_millis() > 0 {
+
+            let steps = geometry::segment_steps(last, target, max_step);
+            let interpolated = steps.len() > 1;
+            for p in steps {
+                if control.stopped() {
+                    return Ok(());
+                }
+                pen.move_to(p)?;
+                if interpolated && substep_sleep {
+                    thread::sleep(SUBSTEP_SLEEP);
+                }
+            }
+            last = target;
+            control.progress_done.fetch_add(1, Ordering::AcqRel);
+
+            if !delay.is_zero() {
                 thread::sleep(delay);
             }
         }
 
-        enigo.button(Button::Right, Direction::Release).map_err(|e| format!("鼠标点击失败: {:?}", e))?;
-        thread::sleep(Duration::from_millis(5));
+        pen.up()?;
+        thread::sleep(RELEASE_SETTLE);
     }
 
-    let _ = enigo.button(Button::Right, Direction::Release);
     Ok(())
-}
-
-fn start_brute_mist_task(
-    enigo: &mut Enigo,
-    config: AppConfig,
-    is_drawing: &AtomicBool,
-    is_paused: &AtomicBool,
-) -> Result<(), String> {
-    let (mw, mh) = if config.monitor_w > 0 {
-        (config.monitor_w, config.monitor_h)
-    } else {
-        enigo.main_display().unwrap_or((1920, 1080))
-    };
-    
-    let sw = mw as f32;
-    let sh = mh as f32;
-    let base_x = config.monitor_x as f32;
-    let base_y = config.monitor_y as f32;
-
-    let box_x = base_x + sw * (config.left_margin as f32 / 100.0);
-    let box_y = base_y + sh * (config.top_margin as f32 / 100.0);
-    let box_w = sw * (1.0 - (config.left_margin + config.right_margin) as f32 / 100.0);
-    let box_h = sh * (1.0 - (config.top_margin + config.bottom_margin) as f32 / 100.0);
-
-    enigo.move_mouse(box_x as i32, box_y as i32, Coordinate::Abs).map_err(|e| format!("鼠标移动失败: {:?}", e))?;
-    thread::sleep(Duration::from_millis(50));
-    enigo.button(Button::Right, Direction::Press).map_err(|e| format!("鼠标点击失败: {:?}", e))?;
-    thread::sleep(Duration::from_millis(10));
-
-    // 方案 A: 随机乱麻填涂 (Random Hairball)
-    // 使用极简 LCG 伪随机数生成器以保证极速
-    let mut seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-
-    let iterations = 8000; // 极高频跳跃
-    for i in 0..iterations {
-        // 每 100 次检查一次状态，兼顾速度与响应
-        if i % 100 == 0 {
-            if !is_drawing.load(Ordering::Acquire) { break; }
-            if check_pause(enigo, is_drawing, is_paused)? {
-                // 恢复后重新定位
-                enigo.move_mouse(box_x as i32, box_y as i32, Coordinate::Abs).map_err(|e| format!("鼠标移动失败: {:?}", e))?;
-            }
-        }
-
-        // 极简 LCG: next = (a * seed + c) % m
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-        let rx = (seed % 1000) as f32 / 1000.0;
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-        let ry = (seed % 1000) as f32 / 1000.0;
-
-        let px = (box_x + rx * box_w) as i32;
-        let py = (box_y + ry * box_h) as i32;
-
-        enigo.move_mouse(px, py, Coordinate::Abs).map_err(|e| format!("鼠标移动失败: {:?}", e))?;
-        
-        // 可选：极微小延迟给系统一点处理喘息（通常不需要，取决于驱动）
-        // if i % 10 == 0 { std::hint::spin_loop(); }
-    }
-
-    let _ = enigo.button(Button::Right, Direction::Release);
-    Ok(())
-}
-
-fn check_pause(enigo: &mut Enigo, is_drawing: &AtomicBool, is_paused: &AtomicBool) -> Result<bool, String> {
-    if is_paused.load(Ordering::Acquire) {
-        enigo.button(Button::Right, Direction::Release).map_err(|e| format!("鼠标点击失败: {:?}", e))?;
-        while is_paused.load(Ordering::Acquire) {
-            if !is_drawing.load(Ordering::Acquire) { return Ok(false); }
-            thread::sleep(Duration::from_millis(100));
-        }
-        enigo.button(Button::Right, Direction::Press).map_err(|e| format!("鼠标点击失败: {:?}", e))?;
-        thread::sleep(Duration::from_millis(20));
-        return Ok(true);
-    }
-    Ok(false)
 }
